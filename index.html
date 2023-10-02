@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" type="text/css" href="style.css" />
+    <title>WebGPU</title>
+</head>
+
+<body>
+    <canvas width="900" height="900"></canvas>
+    <script type="module">
+        const GRID_SIZE = 64;
+        const UPDATE_INTERVAL = 200; // Updating every 200ms (5 times/sec)
+        let step = 0; // Tracking how many simulation steps have been run
+        const WORKGROUP_SIZE = 8;
+
+        // Create an array representing the active state of each cell.
+        const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE);
+
+        const canvas = document.querySelector("canvas");
+
+        //Check if the object exists, which serves as entry point for WebGPU
+        if (!navigator.gpu) {
+            throw new Error("WebGPU not supported on this browser.");
+        }
+        /*Once you know that WebGPU is supported by the browser, the first step in initializing WebGPU for your app is to request a GPUAdapter. 
+        You can think of an adapter as WebGPU's representation of a specific piece of GPU hardware in your device.*/
+        const adapter = await navigator.gpu.requestAdapter(); //Returns a promise
+        if (!adapter) {
+            throw new Error("No appropriate GPUAdapter found.");
+        }
+        /*Once you have an adapter, the last step before you can start working with the GPU is to request a GPUDevice. 
+        The device is the main interface through which most interaction with the GPU happens.*/
+        const device = await adapter.requestDevice();
+        //Configure the canvas to be used with the device just created.
+        const context = canvas.getContext("webgpu");
+        const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({
+            device: device,
+            format: canvasFormat,
+        });
+
+        const vertices = new Float32Array([
+            //   X,    Y,
+            -0.8, -0.8, // Triangle 1 (Blue)
+            0.8, -0.8,
+            0.8, 0.8,
+
+            -0.8, -0.8, // Triangle 2 (Red)
+            0.8, 0.8,
+            -0.8, 0.8,
+        ]);
+
+        //For a lot of values, including vertex data, the GPU-side memory is managed through GPUBuffer objects
+        const vertexBuffer = device.createBuffer({
+            label: "Cell vertices",
+            size: vertices.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        //Copy the vertex data into the buffer's memory
+        device.queue.writeBuffer(vertexBuffer, /*bufferOffset=*/0, vertices);
+        //Tell WebGPU more about the structure of the vertex data
+        const vertexBufferLayout = {
+            arrayStride: 8, //Number of bytes the GPU needs to skip forward in the buffer when looking for next vertex
+            attributes: [{
+                format: "float32x2",
+                offset: 0,
+                shaderLocation: 0, // Position, see vertex shader
+            }],
+        };
+        // Create 2 storage buffers to hold the cell state.
+        const cellStateStorage = [
+            device.createBuffer({
+                label: "Cell State A",
+                size: cellStateArray.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            }),
+            device.createBuffer({
+                label: "Cell State B",
+                size: cellStateArray.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            })
+        ];
+
+        // Marking every third cell of the first grid as active.
+        for (let i = 0; i < cellStateArray.length; i += 3) {
+            cellStateArray[i] = 1;
+        }
+        device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+        // Marking every other cell of the second grid as active.
+        for (let i = 0; i < cellStateArray.length; i++) {
+            // Set each cell to a random state
+            cellStateArray[i] = Math.random() > 0.6 ? 1 : 0;
+
+        }
+        device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+
+        //Shader code
+        const cellShaderModule = device.createShaderModule({
+            label: "Cell shader",
+            code: `
+            struct VertexInput {
+            @location(0) pos: vec2f,
+            @builtin(instance_index) instance: u32,
+            };
+
+            struct VertexOutput {
+            @builtin(position) pos: vec4f,
+            @location(0) cell: vec2f, // output struct to pass data to frag shader
+
+            };
+            @group(0) @binding(0) var<uniform> grid: vec2f;
+            @group(0) @binding(1) var<storage> cellState: array<u32>;
+            @vertex
+              fn vertexMain(@location(0) pos: vec2f,
+              @builtin(instance_index) instance: u32) -> VertexOutput {
+                let i = f32(instance);
+                let cell = vec2f(i % grid.x, floor(i / grid.x));
+                let state = f32(cellState[instance]); // New line!
+
+                let cellOffset = cell / grid * 2;
+                // Scale the position by the cell's active state.
+                let gridPos = (pos*state+1) / grid - 1 + cellOffset;
+
+                var output: VertexOutput;
+                output.pos = vec4f(gridPos, 0, 1);
+                output.cell = cell;
+                return output;
+}          
+                struct FragInput {
+                @location(0) cell: vec2f,
+                };
+            @fragment
+            //Receive value by adding argument with the same @location
+            fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+            let c = input.cell / grid;
+            return vec4f(c, 1-c.x, 1);
+            }
+             `
+        });
+
+        // Compute shader that will process the simulation.
+        const simulationShaderModule = device.createShaderModule({
+            label: "Game of Life simulation shader",
+            code: `
+            @group(0) @binding(0) var<uniform> grid: vec2f;
+            @group(0) @binding(1) var<storage> cellStateIn: array<u32>;
+            @group(0) @binding(2) var<storage, read_write> cellStateOut: array<u32>;
+                
+            fn cellIndex(cell: vec2u) -> u32 {
+            return (cell.y % u32(grid.y)) * u32(grid.x) +
+                   (cell.x % u32(grid.x));
+                }
+
+
+            //The cellActive function returns one if the cell is active, so adding the return value of calling cellActive for all eight surrounding cells gives you how many neighboring cells are active
+            fn cellActive(x: u32, y: u32) -> u32 {
+            return cellStateIn[cellIndex(vec2(x, y))];
+            }
+
+            @compute
+            @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE}) //This tells the shader that work done with this function is done in (8 x 8 x 1) groups, any axis left off has 1 default
+            fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
+                // Determine how many active neighbors this cell has.
+  let activeNeighbors = cellActive(cell.x+1, cell.y+1) +
+                        cellActive(cell.x+1, cell.y) +
+                        cellActive(cell.x+1, cell.y-1) +
+                        cellActive(cell.x, cell.y-1) +
+                        cellActive(cell.x-1, cell.y-1) +
+                        cellActive(cell.x-1, cell.y) +
+                        cellActive(cell.x-1, cell.y+1) +
+                        cellActive(cell.x, cell.y+1);
+
+                let i = cellIndex(cell.xy);
+
+
+                switch activeNeighbors {
+                    case 2: {
+                    cellStateOut[i] = cellStateIn[i];
+                    }
+                    case 3: {
+                    cellStateOut[i] = 1;
+                    }
+                    default: {
+                    cellStateOut[i] = 0;
+                    }
+                }
+
+        }`
+        });
+        const bindGroupLayout = device.createBindGroupLayout({
+            label: "Cell Bind Group Layout",
+            entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+                buffer: {} // Grid uniform buffer
+            }, {
+                binding: 1,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" } // Cell state input buffer
+            }, {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+                buffer: { type: "storage" } // Cell state output buffer
+            }]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+            label: "Cell Pipeline Layout",
+            bindGroupLayouts: [bindGroupLayout],
+        });
+        //A render pipeline needs to be created as a shader module can't be used for rendering on its own
+        /*Controls how geometry is drawn, including things like which shaders are used, 
+        how to interpret data in vertex buffers, which kind of geometry should be rendered*/
+        const cellPipeline = device.createRenderPipeline({
+            label: "Cell pipeline",
+            layout: pipelineLayout, //types of inputs the pipeline needs
+            vertex: {
+                module: cellShaderModule,
+                entryPoint: "vertexMain", //name of the function in the shader code called for every vertex invocation
+                buffers: [vertexBufferLayout] //array of GPUVertexBufferLayout objects that describe how your data is packed in the vertex buffers that you use this pipeline with
+            },
+            fragment: {
+                module: cellShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [{
+                    format: canvasFormat //the targetsthat this pipeline is used with
+                }]
+            }
+        });
+        const simulationPipeline = device.createComputePipeline({
+            label: "Simulation pipeline",
+            layout: pipelineLayout,
+            compute: {
+                module: simulationShaderModule,
+                entryPoint: "computeMain",
+            }
+        });
+
+        // Create a uniform buffer that describes the grid.
+        const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+        const uniformBuffer = device.createBuffer({
+            label: "Grid Uniforms",
+            size: uniformArray.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+
+        const bindGroups = [
+            device.createBindGroup({
+                label: "Cell renderer bind group A",
+                layout: bindGroupLayout,
+                entries: [{
+                    binding: 0,
+                    resource: { buffer: uniformBuffer }
+                }, {
+                    binding: 1,
+                    resource: { buffer: cellStateStorage[0] }
+                },
+                {
+                    binding: 2,
+                    resource: { buffer: cellStateStorage[1] }
+                }
+                ],
+            }),
+            device.createBindGroup({
+                label: "Cell renderer bind group B",
+                layout: cellPipeline.getBindGroupLayout(0),
+                entries: [{
+                    binding: 0,
+                    resource: { buffer: uniformBuffer }
+                }, {
+                    binding: 1,
+                    resource: { buffer: cellStateStorage[1] }
+                }, {
+                    binding: 2, // New Entry
+                    resource: { buffer: cellStateStorage[0] }
+                }],
+            })
+        ];
+
+
+
+        //Render function
+        function updateGrid() {
+
+            //Encoder which provides interface for recording GPU commands
+            const encoder = device.createCommandEncoder();
+            //You want to do the compute pass before the render pass because it allows the render pass to immediately use the latest results from the compute pass
+            const computePass = encoder.beginComputePass();
+            //Set the pipeline and bind group inside the compute pass, using the same pattern for switching between bind groups as you do for the rendering pass
+            computePass.setPipeline(simulationPipeline);
+            computePass.setBindGroup(0, bindGroups[step % 2]);
+            //Dispatch the work to the compute shader, telling it how many workgroups you want to execute on each axis
+            const workgroupCount = Math.ceil(GRID_SIZE / WORKGROUP_SIZE);
+            computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+
+            computePass.end();
+            //Increment here so that the output buffer of the compute pipeline becomes the input buffer for the render pipeline.
+            step++; // Incrementing the step count
+
+
+            //Creating a render pass (they are when all drawing operations in WebGPU happen)
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    loadOp: "clear",
+                    clearValue: { r: 0, g: 0, b: 0.4, a: 1 },
+                    storeOp: "store",
+                }]
+            });
+            //Drawing the grid
+            pass.setPipeline(cellPipeline);
+            pass.setBindGroup(0, bindGroups[step % 2]);
+            pass.setVertexBuffer(0, vertexBuffer);
+            pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE); // 6 vertices
+
+            pass.end();
+            // Finish the command buffer and immediately submit it.
+            device.queue.submit([encoder.finish()]);
+        };
+
+        /*Simply making these calls does not cause the GPU to actually do anything.
+        They're just recording commands for the GPU to do later.*/
+        // const commandBuffer = encoder.finish();
+        // /*Submit the command buffer to the GPU using the queue of the GPUDevice. The queue performs all GPU commands, ensuring that their execution is well ordered and properly synchronized.*/
+        // device.queue.submit([commandBuffer]);
+
+        // Schedule updateGrid() to run repeatedly
+        setInterval(updateGrid, UPDATE_INTERVAL);
+    </script>
+</body>
+
+</html>
